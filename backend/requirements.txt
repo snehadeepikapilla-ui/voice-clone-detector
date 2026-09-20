@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+librosa
+numpy
+soundfile
+scikit-learn
+pydub
+imageio-ffmpeg
