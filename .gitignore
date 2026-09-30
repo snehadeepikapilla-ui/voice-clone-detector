@@ -27,4 +27,3 @@ dataset/**/*.ogg
 # IDE
 .vscode/
 .idea/
-backend/ai_engine/models/voice_detector.pkl
