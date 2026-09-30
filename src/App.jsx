@@ -1,46 +1,36 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
+const API_URL = "http://127.0.0.1:8000";
+const WS_URL = "ws://127.0.0.1:8000/ws/detect";
+
 function App() {
+  const [mode, setMode] = useState("upload");
   const [audioFile, setAudioFile] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [liveStatus, setLiveStatus] = useState("");
+  const [live, setLive] = useState(false);
+  const [liveText, setLiveText] = useState("Ready for voice analysis");
   const [error, setError] = useState("");
-
-  const [stats, setStats] = useState({
-    analyzed: 0,
-    threats: 0,
-    human: 0,
-  });
 
   const socketRef = useRef(null);
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
+  const fileInputRef = useRef(null);
 
-  // -----------------------------
-  // File selection
-  // -----------------------------
-  const handleFileChange = (event) => {
-    const file = event.target.files[0];
+  const handleFile = (event) => {
+    const file = event.target.files?.[0];
 
-    if (!file) {
-      setAudioFile(null);
-      return;
-    }
+    if (!file) return;
 
     setAudioFile(file);
     setResult(null);
     setError("");
   };
 
-  // -----------------------------
-  // Upload & Analyze
-  // -----------------------------
-  const analyzeAudio = async () => {
+  const analyzeVoice = async () => {
     if (!audioFile) {
-      setError("Please select an audio file first.");
+      setError("Please select an audio file.");
       return;
     }
 
@@ -52,89 +42,93 @@ function App() {
       const formData = new FormData();
       formData.append("file", audioFile);
 
-      const response = await fetch(
-        "http://127.0.0.1:8000/detect",
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
+      const response = await fetch(`${API_URL}/detect`, {
+        method: "POST",
+        body: formData,
+      });
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.detail || "Detection failed.");
+        throw new Error(data.detail || "Voice analysis failed.");
       }
 
       setResult(data);
-
-      setStats((previous) => ({
-        analyzed: previous.analyzed + 1,
-        threats:
-          previous.threats +
-          (data.ai_clone_probability >= 50 ? 1 : 0),
-        human:
-          previous.human +
-          (data.ai_clone_probability < 50 ? 1 : 0),
-      }));
     } catch (err) {
-      setError(
-        err.message || "Unable to connect to backend."
-      );
+      setError(err.message || "Backend connection failed.");
     } finally {
       setLoading(false);
     }
   };
 
-  // -----------------------------
-  // Start Live Detection
-  // -----------------------------
-  const startLiveDetection = async () => {
-    if (isRecording) return;
-
-    setError("");
-    setResult(null);
-    setLiveStatus("Requesting microphone...");
-
-    try {
-      if (
-        !navigator.mediaDevices ||
-        !navigator.mediaDevices.getUserMedia
-      ) {
-        throw new Error(
-          "Microphone access is not supported by this browser."
-        );
+  const stopLive = () => {
+    if (recorderRef.current) {
+      try {
+        if (recorderRef.current.state !== "inactive") {
+          recorderRef.current.stop();
+        }
+      } catch (err) {
+        console.log("Recorder stop:", err);
       }
 
-      const stream =
-        await navigator.mediaDevices.getUserMedia({
-          audio: true,
-        });
+      recorderRef.current = null;
+    }
+
+    if (socketRef.current) {
+      try {
+        if (
+          socketRef.current.readyState === WebSocket.OPEN ||
+          socketRef.current.readyState === WebSocket.CONNECTING
+        ) {
+          socketRef.current.close();
+        }
+      } catch (err) {
+        console.log("Socket close:", err);
+      }
+
+      socketRef.current = null;
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    setLive(false);
+    setLiveText("Ready for voice analysis");
+  };
+
+  const startLive = async () => {
+    setError("");
+    setResult(null);
+    setLiveText("Connecting to live detection...");
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Microphone access is not supported by this browser.");
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
 
       streamRef.current = stream;
 
-      const socket = new WebSocket(
-        "ws://127.0.0.1:8000/ws/detect"
-      );
-
+      const socket = new WebSocket(WS_URL);
       socketRef.current = socket;
 
       socket.onopen = () => {
-        setLiveStatus("Live detection connected.");
-        setIsRecording(true);
+        setLive(true);
+        setLiveText("Listening to live audio...");
 
         let mimeType = "";
 
-        if (
-          MediaRecorder.isTypeSupported(
-            "audio/webm;codecs=opus"
-          )
-        ) {
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
           mimeType = "audio/webm;codecs=opus";
-        } else if (
-          MediaRecorder.isTypeSupported("audio/webm")
-        ) {
+        } else if (MediaRecorder.isTypeSupported("audio/webm")) {
           mimeType = "audio/webm";
+        } else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) {
+          mimeType = "audio/ogg;codecs=opus";
         }
 
         const recorder = mimeType
@@ -145,26 +139,24 @@ function App() {
 
         recorder.ondataavailable = async (event) => {
           if (
-            event.data &&
-            event.data.size > 0 &&
+            event.data?.size > 0 &&
             socket.readyState === WebSocket.OPEN
           ) {
-            const buffer =
-              await event.data.arrayBuffer();
-
-            socket.send(buffer);
+            try {
+              const buffer = await event.data.arrayBuffer();
+              socket.send(buffer);
+            } catch (err) {
+              console.error("Audio send error:", err);
+            }
           }
         };
 
-        recorder.onerror = () => {
-          setError("Microphone recording error.");
+        recorder.onerror = (event) => {
+          console.error("Recorder error:", event);
+          setError("Microphone recording failed.");
         };
 
         recorder.start(1000);
-
-        setLiveStatus(
-          "Listening... speak normally."
-        );
       };
 
       socket.onmessage = (event) => {
@@ -172,439 +164,608 @@ function App() {
           const data = JSON.parse(event.data);
 
           if (data.message) {
-            setLiveStatus(data.message);
+            setLiveText(data.message);
           }
 
-          if (data.result) {
+          if (
+            data.ai_clone_probability !== undefined ||
+            data.probability !== undefined ||
+            data.result
+          ) {
             setResult(data);
-
-            setStats((previous) => ({
-              analyzed: previous.analyzed + 1,
-              threats:
-                previous.threats +
-                (data.ai_clone_probability >= 50
-                  ? 1
-                  : 0),
-              human:
-                previous.human +
-                (data.ai_clone_probability < 50
-                  ? 1
-                  : 0),
-            }));
           }
-        } catch (err) {
-          console.error(
-            "Invalid WebSocket message:",
-            err
-          );
+        } catch {
+          console.log("Live response:", event.data);
         }
       };
 
-      socket.onerror = () => {
+      socket.onerror = (event) => {
+        console.error("WebSocket error:", event);
+
         setError(
-          "Live detection connection failed. Make sure the backend is running."
+          "Live detection connection failed. Make sure the backend is running on port 8000."
         );
-        setLiveStatus("");
+
+        setLive(false);
+        setLiveText("Live detection unavailable");
       };
 
       socket.onclose = () => {
-        setIsRecording(false);
-        setLiveStatus("Live detection stopped.");
+        setLive(false);
+
+        if (recorderRef.current) {
+          try {
+            if (recorderRef.current.state !== "inactive") {
+              recorderRef.current.stop();
+            }
+          } catch (err) {
+            console.log("Recorder close:", err);
+          }
+
+          recorderRef.current = null;
+        }
+
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach((track) => track.stop());
+          streamRef.current = null;
+        }
+
+        socketRef.current = null;
       };
     } catch (err) {
-      console.error(err);
+      console.error("Live detection error:", err);
+
+      setLive(false);
+      setLiveText("Ready for voice analysis");
+
+      if (err.name === "NotAllowedError") {
+        setError("Microphone permission was denied.");
+      } else {
+        setError(
+          err.message || "Could not start live detection."
+        );
+      }
 
       if (streamRef.current) {
-        streamRef.current
-          .getTracks()
-          .forEach((track) => track.stop());
-
+        streamRef.current.getTracks().forEach((track) => track.stop());
         streamRef.current = null;
       }
 
-      setIsRecording(false);
-      setLiveStatus("");
-
-      setError(
-        err.message ||
-          "Unable to start live detection."
-      );
-    }
-  };
-
-  // -----------------------------
-  // Stop Live Detection
-  // -----------------------------
-  const stopLiveDetection = () => {
-    if (recorderRef.current) {
-      if (
-        recorderRef.current.state !== "inactive"
-      ) {
-        recorderRef.current.stop();
-      }
-
+      socketRef.current = null;
       recorderRef.current = null;
     }
-
-    if (streamRef.current) {
-      streamRef.current
-        .getTracks()
-        .forEach((track) => track.stop());
-
-      streamRef.current = null;
-    }
-
-    if (socketRef.current) {
-      if (
-        socketRef.current.readyState ===
-        WebSocket.OPEN
-      ) {
-        socketRef.current.close(1000);
-      }
-
-      socketRef.current = null;
-    }
-
-    setIsRecording(false);
-    setLiveStatus("Live detection stopped.");
   };
 
-  // -----------------------------
-  // Cleanup
-  // -----------------------------
   useEffect(() => {
     return () => {
       if (recorderRef.current) {
-        if (
-          recorderRef.current.state !== "inactive"
-        ) {
-          recorderRef.current.stop();
-        }
-      }
-
-      if (streamRef.current) {
-        streamRef.current
-          .getTracks()
-          .forEach((track) => track.stop());
+        try {
+          if (recorderRef.current.state !== "inactive") {
+            recorderRef.current.stop();
+          }
+        } catch {}
       }
 
       if (socketRef.current) {
-        socketRef.current.close();
+        try {
+          socketRef.current.close();
+        } catch {}
+      }
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
       }
     };
   }, []);
 
-  // -----------------------------
-  // Probability
-  // -----------------------------
-  const probability =
-    result?.ai_clone_probability ?? 0;
+  const aiScore = Number(
+    result?.ai_clone_probability ??
+      result?.probability ??
+      0
+  );
 
-  const isAI = probability >= 50;
+  const safeAIScore = Math.min(
+    100,
+    Math.max(0, aiScore)
+  );
 
-  // -----------------------------
-  // UI
-  // -----------------------------
+  const humanScore = Math.max(
+    0,
+    100 - safeAIScore
+  );
+
+  const resultText =
+    result?.result ||
+    (safeAIScore >= 50
+      ? "Potential AI-generated voice"
+      : "Likely human voice");
+
+  const isAI = safeAIScore >= 50;
+
+  const duration =
+    result?.features?.duration_seconds ??
+    result?.duration_seconds;
+
+  const mfcc =
+    result?.features?.mfcc_mean ??
+    result?.mfcc_mean;
+
+  const spectral =
+    result?.features?.spectral_centroid_mean ??
+    result?.spectral_centroid_mean;
+
+  const zcr =
+    result?.features?.zero_crossing_rate_mean ??
+    result?.zero_crossing_rate_mean;
+
   return (
     <div className="app">
+      <div className="grid-bg" />
 
-      {/* Header */}
-      <header className="header">
-        <div>
-          <h1>Voice Clone Detector</h1>
+      <div className="ambient ambient-one" />
+      <div className="ambient ambient-two" />
 
-          <p>
-            AI-powered voice analysis for detecting
-            potentially cloned or synthetic speech.
-          </p>
+      {/* NAVBAR */}
+      <header className="navbar">
+        <div className="brand">
+          <div className="brand-logo">VG</div>
+
+          <div>
+            <h1>VoiceCloneDetector</h1>
+            <span>VOICE AUTHENTICITY SYSTEM</span>
+          </div>
         </div>
 
-        <div className="status">
-          <span className="status-dot"></span>
-          System Online
+        <div className="system-status">
+          <span className="status-dot" />
+          SYSTEM ONLINE
         </div>
       </header>
 
-      <main className="container">
+      <main className="main">
 
-        {/* Upload Section */}
-        <section className="card">
-          <h2>Analyze Voice</h2>
+        {/* HERO */}
+        <section className="hero">
+          <div className="hero-content">
 
-          <p className="subtitle">
-            Upload a WAV, MP3, M4A or OGG audio file.
-          </p>
+            <div className="hero-tag">
+              <span />
+              AI VOICE SECURITY
+            </div>
 
-          <div className="upload-box">
+           <h2 className="hero-title">
+  NEXUS
+</h2>
 
-            <input
-              type="file"
-              accept=".wav,.mp3,.m4a,.ogg,audio/*"
-              onChange={handleFileChange}
-            />
+            <p>
+              Machine-learning based voice analysis for
+              identifying potentially cloned, synthetic,
+              and manipulated speech.
+            </p>
 
-            {audioFile && (
-              <p className="file-name">
-                Selected: {audioFile.name}
-              </p>
-            )}
+            <div className="hero-meta">
+              <span>VOICE AUTHENTICITY SYSTEM</span>
+              <span>VG / 01</span>
+            </div>
+          </div>
+
+          {/* PULSATING ORB */}
+          <div
+            className={`orb-area ${
+              live ? "orb-live" : ""
+            }`}
+          >
+            <div className="orb-ring ring-one" />
+            <div className="orb-ring ring-two" />
+            <div className="orb-ring ring-three" />
+
+            <div className="orb-halo" />
+
+            <div className="orb">
+              <div className="orb-inner">
+                <span>VG</span>
+              </div>
+
+              <div className="orb-wave">
+                <i />
+                <i />
+                <i />
+                <i />
+                <i />
+                <i />
+                <i />
+              </div>
+            </div>
+
+            <div className="orb-label orb-label-top">
+              AI SIGNAL
+            </div>
+
+            <div className="orb-label orb-label-bottom">
+              {live ? "LISTENING" : "VOICE ANALYSIS"}
+            </div>
+          </div>
+        </section>
+
+        {/* MODE CONTROLS */}
+        <section className="controls">
+          <div className="tabs">
 
             <button
-              className="primary-button"
-              onClick={analyzeAudio}
-              disabled={!audioFile || loading}
+              className={
+                mode === "upload" ? "active" : ""
+              }
+              onClick={() => {
+                stopLive();
+                setMode("upload");
+                setResult(null);
+                setError("");
+              }}
             >
-              {loading
-                ? "Analyzing..."
-                : "Analyze Voice"}
+              AUDIO ANALYSIS
+            </button>
+
+            <button
+              className={
+                mode === "live" ? "active" : ""
+              }
+              onClick={() => {
+                setMode("live");
+                setResult(null);
+                setError("");
+              }}
+            >
+              LIVE DETECTION
             </button>
 
           </div>
+
+          <div className="control-status">
+            <span />
+            REAL-TIME ANALYSIS
+          </div>
         </section>
 
-        {/* Live Detection */}
-        <section className="card">
+        {/* ANALYSIS */}
+        <section className="analysis">
 
-          <h2>Live Voice Detection</h2>
+          {/* INPUT CARD */}
+          <div className="card">
 
-          <p className="subtitle">
-            Speak into your microphone for real-time
-            voice analysis.
-          </p>
-
-          <div className="live-controls">
-
-            {!isRecording ? (
-              <button
-                className="primary-button"
-                onClick={startLiveDetection}
-              >
-                🎙 Start Live Detection
-              </button>
-            ) : (
-              <button
-                className="stop-button"
-                onClick={stopLiveDetection}
-              >
-                ⏹ Stop Detection
-              </button>
-            )}
-
-          </div>
-
-          {liveStatus && (
-            <p className="live-status">
-              {liveStatus}
-            </p>
-          )}
-
-        </section>
-
-        {/* Error */}
-        {error && (
-          <div className="error-box">
-            ⚠️ {error}
-          </div>
-        )}
-
-        {/* Detection Result */}
-        {result && (
-          <section className="card result-card">
-
-            <h2>Detection Result</h2>
-
-            <div className="result-main">
-
+            <div className="card-heading">
               <div>
+                <small>01</small>
 
-                <p className="result-label">
-                  Result
-                </p>
+                <h3>
+                  {mode === "upload"
+                    ? "AUDIO ANALYSIS"
+                    : "LIVE DETECTION"}
+                </h3>
+              </div>
 
-                <h3
-                  className={
-                    isAI
-                      ? "ai-result"
-                      : "human-result"
+              <span>
+                {mode === "upload"
+                  ? "FILE INPUT"
+                  : "MIC INPUT"}
+              </span>
+            </div>
+
+            {mode === "upload" ? (
+              <>
+                <div
+                  className="upload-box"
+                  onClick={() =>
+                    fileInputRef.current?.click()
                   }
                 >
-                  {result.result}
-                </h3>
+                  <div className="upload-icon">
+                    ↑
+                  </div>
+
+                  <strong>
+                    {audioFile
+                      ? audioFile.name
+                      : "Select voice recording"}
+                  </strong>
+
+                  <small>
+                    WAV / MP3 / M4A / OGG
+                  </small>
+
+                  <div className="scan-line" />
+                </div>
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".wav,.mp3,.m4a,.ogg,audio/*"
+                  onChange={handleFile}
+                  hidden
+                />
+
+                <button
+                  className="primary-btn"
+                  disabled={!audioFile || loading}
+                  onClick={analyzeVoice}
+                >
+                  {loading
+                    ? "ANALYZING..."
+                    : "ANALYZE VOICE →"}
+                </button>
+              </>
+            ) : (
+              <div className="live-panel">
+
+                <div
+                  className={`mini-orb ${
+                    live ? "active" : ""
+                  }`}
+                >
+                  🎙
+                </div>
+
+                <p>{liveText}</p>
+
+                <div className="waveform">
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                  <i />
+                </div>
+
+                {!live ? (
+                  <button
+                    className="primary-btn"
+                    onClick={startLive}
+                  >
+                    START DETECTION
+                  </button>
+                ) : (
+                  <button
+                    className="stop-btn"
+                    onClick={stopLive}
+                  >
+                    STOP DETECTION
+                  </button>
+                )}
 
               </div>
+            )}
+          </div>
 
-              <div className="probability">
+          {/* RESULT CARD */}
+          <div className="card">
 
-                <span>
-                  AI Probability
-                </span>
+            <div className="card-heading">
+              <div>
+                <small>02</small>
+
+                <h3>
+                  AUTHENTICITY ANALYSIS
+                </h3>
+              </div>
+
+              <span>
+                {result ? "ANALYZED" : "WAITING"}
+              </span>
+            </div>
+
+            {!result ? (
+              <div className="empty-result">
+
+                <div className="empty-orb">
+                  VG
+                </div>
 
                 <strong>
-                  {probability}%
+                  Waiting for voice analysis
                 </strong>
 
-              </div>
-
-            </div>
-
-            {/* Probability Bar */}
-            <div className="progress-container">
-
-              <div
-                className="progress-bar"
-                style={{
-                  width: `${probability}%`,
-                }}
-              ></div>
-
-            </div>
-
-            {/* Risk */}
-            <div className="risk">
-
-              <strong>
-                {probability >= 70
-                  ? "High Risk"
-                  : probability >= 50
-                  ? "Medium Risk"
-                  : "Low Risk"}
-              </strong>
-
-            </div>
-
-            {/* Decision Engine Results */}
-            {result.risk_level && (
-              <div className="decision-box">
-
-                <div>
-                  <span>Risk Level</span>
-
-                  <strong>
-                    {result.risk_level}
-                  </strong>
-                </div>
-
-                <div>
-                  <span>
-                    Recommended Action
-                  </span>
-
-                  <strong>
-                    {result.recommended_action}
-                  </strong>
-                </div>
+                <p>
+                  Upload audio or start live
+                  detection
+                </p>
 
               </div>
-            )}
+            ) : (
+              <div className="result">
 
-            {/* Audio Features */}
-            {result.features && (
-              <div className="features">
+                <div className="score-area">
 
-                <h3>Audio Features</h3>
+                  <div
+                    className={`score-ring ${
+                      isAI ? "danger" : "human"
+                    }`}
+                    style={{
+                      "--score": `${safeAIScore}%`,
+                    }}
+                  >
+                    <div className="score-center">
+                      <strong>
+                        {safeAIScore.toFixed(1)}%
+                      </strong>
 
-                <div className="feature-grid">
-
-                  <div className="feature">
-                    <span>Duration</span>
-
-                    <strong>
-                      {result.features.duration_seconds?.toFixed(
-                        2
-                      )}{" "}
-                      sec
-                    </strong>
+                      <span>
+                        AI SCORE
+                      </span>
+                    </div>
                   </div>
 
-                  <div className="feature">
-                    <span>MFCC Mean</span>
-
-                    <strong>
-                      {result.features.mfcc_mean?.toFixed(
-                        2
-                      )}
-                    </strong>
-                  </div>
-
-                  <div className="feature">
-                    <span>MFCC Std</span>
-
-                    <strong>
-                      {result.features.mfcc_std?.toFixed(
-                        2
-                      )}
-                    </strong>
-                  </div>
-
-                  <div className="feature">
+                  <div className="score-labels">
                     <span>
-                      Spectral Centroid
+                      AI {safeAIScore.toFixed(1)}%
                     </span>
 
-                    <strong>
-                      {result.features.spectral_centroid_mean?.toFixed(
-                        2
-                      )}{" "}
-                      Hz
-                    </strong>
+                    <span>
+                      HUMAN {humanScore.toFixed(1)}%
+                    </span>
                   </div>
 
-                  <div className="feature">
-                    <span>ZCR</span>
+                </div>
 
-                    <strong>
-                      {result.features.zero_crossing_rate_mean?.toFixed(
-                        4
-                      )}
-                    </strong>
+                <div className="result-info">
+
+                  <div
+                    className={`risk ${
+                      isAI
+                        ? "risk-ai"
+                        : "risk-human"
+                    }`}
+                  >
+                    {isAI
+                      ? "SUSPICIOUS VOICE"
+                      : "LIKELY HUMAN"}
                   </div>
 
-                  <div className="feature">
-                    <span>RMS Energy</span>
+                  <h4>{resultText}</h4>
 
-                    <strong>
-                      {result.features.rms_mean?.toFixed(
-                        4
-                      )}
-                    </strong>
+                  <div className="details">
+
+                    <div>
+                      <span>
+                        AI probability
+                      </span>
+
+                      <b>
+                        {safeAIScore.toFixed(1)}%
+                      </b>
+                    </div>
+
+                    <div>
+                      <span>
+                        Duration
+                      </span>
+
+                      <b>
+                        {duration !== undefined
+                          ? `${Number(duration).toFixed(2)}s`
+                          : "--"}
+                      </b>
+                    </div>
+
+                    <div>
+                      <span>MFCC</span>
+
+                      <b>
+                        {mfcc !== undefined
+                          ? Number(mfcc).toFixed(2)
+                          : "--"}
+                      </b>
+                    </div>
+
+                    <div>
+                      <span>
+                        Spectral centroid
+                      </span>
+
+                      <b>
+                        {spectral !== undefined
+                          ? Number(spectral).toFixed(0)
+                          : "--"}
+                      </b>
+                    </div>
+
                   </div>
+
+                  {result.recommended_action && (
+                    <div className="recommendation">
+
+                      <small>
+                        RECOMMENDED ACTION
+                      </small>
+
+                      <p>
+                        {result.recommended_action}
+                      </p>
+
+                    </div>
+                  )}
 
                 </div>
               </div>
             )}
-
-          </section>
-        )}
-
-        {/* Statistics */}
-        <section className="stats-grid">
-
-          <div className="stat-card">
-            <span>Analyzed</span>
-            <strong>{stats.analyzed}</strong>
           </div>
-
-          <div className="stat-card">
-            <span>Potential AI</span>
-            <strong>{stats.threats}</strong>
-          </div>
-
-          <div className="stat-card">
-            <span>Human</span>
-            <strong>{stats.human}</strong>
-          </div>
-
         </section>
 
+        {/* ERROR */}
+        {error && (
+          <div className="error">
+            {error}
+          </div>
+        )}
+
+        {/* FEATURES */}
+        <section className="card wide">
+
+          <div className="card-heading">
+            <div>
+              <small>03</small>
+              <h3>AUDIO SIGNAL</h3>
+            </div>
+
+            <span>FEATURES</span>
+          </div>
+
+          <div className="features">
+
+            <div>
+              <span>DURATION</span>
+
+              <strong>
+                {duration !== undefined
+                  ? `${Number(duration).toFixed(2)}s`
+                  : "--"}
+              </strong>
+            </div>
+
+            <div>
+              <span>MFCC</span>
+
+              <strong>
+                {mfcc !== undefined
+                  ? Number(mfcc).toFixed(2)
+                  : "--"}
+              </strong>
+            </div>
+
+            <div>
+              <span>SPECTRAL</span>
+
+              <strong>
+                {spectral !== undefined
+                  ? Number(spectral).toFixed(0)
+                  : "--"}
+              </strong>
+            </div>
+
+            <div>
+              <span>ZCR</span>
+
+              <strong>
+                {zcr !== undefined
+                  ? Number(zcr).toFixed(3)
+                  : "--"}
+              </strong>
+            </div>
+
+          </div>
+        </section>
+
+        {/* FOOTER */}
+        <footer>
+          <span>VOICEGUARD AI</span>
+
+          <span>
+            VOICE AUTHENTICITY SYSTEM
+          </span>
+        </footer>
+
       </main>
-
-      {/* Footer */}
-      <footer>
-        <p>
-          Voice Clone Detector • AI Voice Analysis
-        </p>
-      </footer>
-
     </div>
   );
 }
